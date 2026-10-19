@@ -1,13 +1,24 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Editors / IDE
+.idea/
+.vscode/
 *.swp
+
+# OS
+.DS_Store
+
+# Logs / temp / cache
 *.log
 *.tmp
 *.bak
 *.cache
-*.DS_Store
-*.idea/
-*.vscode/
+
+# RL training outputs
+rl/tb_logs/
+
