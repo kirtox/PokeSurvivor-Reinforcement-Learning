@@ -1,0 +1,7 @@
+gymnasium
+stable-baselines3
+torch
+playwright
+numpy
+pygame
+tensorboard
