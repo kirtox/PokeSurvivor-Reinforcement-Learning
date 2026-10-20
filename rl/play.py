@@ -25,7 +25,7 @@ DANGER = (255, 90, 90)
 OK = (120, 220, 140)
 
 
-def draw_dashboard(screen, font, action, raw, reward_hist):
+def draw_dashboard(screen, font, action, raw, reward_hist, last_pick=None):
     screen.fill(BG)
     move_idx, skill_idx = int(action[0]), int(action[1])
 
@@ -64,17 +64,18 @@ def draw_dashboard(screen, font, action, raw, reward_hist):
         f"Level: {raw['level']}",
         f"Kills: {raw['kills']}",
         f"HP:    {raw['hp']:.0f}/{raw['maxHp']:.0f}",
+        f"Card:  {last_pick or '-'}",
     ]
     for i, s in enumerate(stats):
         screen.blit(font.render(s, True, FG), (20, 170 + i * 26))
-    bar = pygame.Rect(20, 270, 380, 18)
+    bar = pygame.Rect(20, 295, 380, 18)
     pygame.draw.rect(screen, (40, 46, 60), bar, border_radius=4)
     fill = bar.copy(); fill.width = int(bar.width * max(0.0, hp_frac))
     pygame.draw.rect(screen, OK if hp_frac > 0.3 else DANGER, fill, border_radius=4)
 
     # --- reward curve ---
-    screen.blit(font.render("Reward (recent steps)", True, FG), (20, 310))
-    plot = pygame.Rect(20, 335, 380, 150)
+    screen.blit(font.render("Reward (recent steps)", True, FG), (20, 330))
+    plot = pygame.Rect(20, 355, 380, 150)
     pygame.draw.rect(screen, (24, 28, 40), plot)
     if len(reward_hist) > 1:
         vals = list(reward_hist)
@@ -103,6 +104,7 @@ def main():
     font = pygame.font.SysFont("consolas", 18)
     clock = pygame.time.Clock()
     reward_hist = deque(maxlen=200)
+    last_pick = None
 
     obs, info = env.reset()
     running = True
@@ -115,11 +117,14 @@ def main():
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, terminated, truncated, info = env.step(action)
         reward_hist.append(reward)
-        draw_dashboard(screen, font, action, info["raw"], reward_hist)
+        if info["raw"].get("picked"):
+            last_pick = info["raw"]["picked"]["title"]
+        draw_dashboard(screen, font, action, info["raw"], reward_hist, last_pick)
         clock.tick(30)
         if terminated or truncated:
             obs, info = env.reset()
             reward_hist.clear()
+            last_pick = None
 
     pygame.quit()
     env.close()

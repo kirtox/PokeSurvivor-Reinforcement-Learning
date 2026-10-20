@@ -35,8 +35,8 @@ def random_action(env, obs):
 
 
 def stand_still_action(env, obs):
-    # move_idx=0 -> stay put; still cycles the active move so it isn't fully inert.
-    return np.array([0, np.random.randint(0, 5)])
+    # move_idx=0 -> stay put; still cycles the active move so it isn't fully inert; card 0 = first offered.
+    return np.array([0, np.random.randint(0, 5), 0])
 
 
 if __name__ == "__main__":

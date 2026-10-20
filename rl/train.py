@@ -2,11 +2,16 @@
 
 Usage:
   .venv\\Scripts\\python.exe -m rl.train --timesteps 1000000 --n-envs 8
+  .venv\\Scripts\\python.exe -m rl.train --timesteps 1500000 --name NAME --resume   # latest checkpoint
+  .venv\\Scripts\\python.exe -m rl.train --timesteps 1500000 --name NAME --resume rl/models/NAME_249960_steps.zip
+
+With --resume, --timesteps is the TOTAL target, not extra steps.
 
 Starts a small trial by default (1-2M steps) per the agreed success-criteria
 plan: check the tensorboard learning curve before committing to a longer run.
 """
 import argparse
+import re
 from pathlib import Path
 
 from stable_baselines3 import PPO
@@ -27,6 +32,15 @@ def make_env():
     return _init
 
 
+def latest_checkpoint(name):
+    best, best_steps = None, -1
+    for p in MODELS_DIR.glob(f"{name}_*_steps.zip"):
+        m = re.fullmatch(rf"{re.escape(name)}_(\d+)_steps\.zip", p.name)
+        if m and int(m.group(1)) > best_steps:
+            best, best_steps = p, int(m.group(1))
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--timesteps", type=int, default=1_500_000)
@@ -34,13 +48,28 @@ def main():
     ap.add_argument("--name", type=str, default="ppo_ditto_v1")
     ap.add_argument("--checkpoint-freq", type=int, default=50_000,
                     help="save a checkpoint every N total timesteps (0 to disable)")
+    ap.add_argument("--resume", nargs="?", const="latest", default=None,
+                    help="continue from a checkpoint .zip (no value = latest for --name); "
+                         "--timesteps is then the total target")
     args = ap.parse_args()
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     TB_DIR.mkdir(parents=True, exist_ok=True)
 
     vec_env = SubprocVecEnv([make_env() for _ in range(args.n_envs)])
-    model = PPO("MlpPolicy", vec_env, verbose=1, tensorboard_log=str(TB_DIR))
+    if args.resume is None:
+        model = PPO("MlpPolicy", vec_env, verbose=1, tensorboard_log=str(TB_DIR))
+    else:
+        ckpt = latest_checkpoint(args.name) if args.resume == "latest" else Path(args.resume)
+        if ckpt is None or not ckpt.exists():
+            vec_env.close()
+            raise SystemExit(f"No checkpoint found to resume from ({args.resume!r}, name={args.name!r})")
+        model = PPO.load(str(ckpt), env=vec_env, verbose=1, tensorboard_log=str(TB_DIR))
+        print(f"Resumed from {ckpt} at {model.num_timesteps} timesteps")
+    remaining = args.timesteps - model.num_timesteps
+    if remaining <= 0:
+        vec_env.close()
+        raise SystemExit(f"Already at {model.num_timesteps} >= target {args.timesteps}; nothing to do")
     callback = None
     if args.checkpoint_freq > 0:
         # save_freq counts calls per env, so divide by n_envs to get total timesteps
@@ -49,7 +78,8 @@ def main():
             save_path=str(MODELS_DIR),
             name_prefix=args.name,
         )
-    model.learn(total_timesteps=args.timesteps, tb_log_name=args.name, callback=callback)
+    model.learn(total_timesteps=remaining, tb_log_name=args.name, callback=callback,
+                reset_num_timesteps=args.resume is None)
     model.save(str(MODELS_DIR / args.name))
     vec_env.close()
     print(f"Saved model to {MODELS_DIR / args.name}.zip")
