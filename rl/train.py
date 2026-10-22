@@ -11,11 +11,15 @@ Starts a small trial by default (1-2M steps) per the agreed success-criteria
 plan: check the tensorboard learning curve before committing to a longer run.
 """
 import argparse
+import json
 import re
+import time
+from collections import deque
 from pathlib import Path
 
+import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
@@ -23,6 +27,83 @@ from rl.env import PokeSurvivorEnv
 
 MODELS_DIR = Path(__file__).resolve().parent / "models"
 TB_DIR = Path(__file__).resolve().parent / "tb_logs"
+
+
+class StallWatchdog(BaseCallback):
+    """Detects the known stall (env stepping several times slower and/or episodes
+    collapsing to ~10 steps) and writes `flag_path`, then blocks so that rl.supervise can
+    kill the process tree and resume from the last checkpoint. Only meant to run under
+    rl.supervise (--watchdog-file). Placed before CheckpointCallback so a tripped step
+    never saves a checkpoint.
+    """
+    WARMUP = 300      # vec steps ignored after start (browser start-up)
+    WINDOW = 200      # vec steps in the speed window (~15 s when healthy)
+    SLOW = 3.0        # trip if the window is this many times slower than the fastest seen
+    EP_WINDOW = 24    # episodes in the length window
+    EP_DROP = 0.25    # trip if mean episode length < this fraction of the best seen
+    EP_MIN_BEST = 40  # ...only once episodes have been at least this long (steps)
+
+    def __init__(self, flag_path):
+        super().__init__()
+        self.flag_path = Path(flag_path)
+        # Baselines survive restarts: a run that starts already stalled must still be caught.
+        self.base_path = self.flag_path.with_suffix(".baseline.json")
+        self._last = None
+        self._n = 0
+        self._dts = deque(maxlen=self.WINDOW)
+        self._best_dt = None
+        self._eps = deque(maxlen=self.EP_WINDOW)
+        self._best_ep = 0.0
+        if self.base_path.exists():
+            try:
+                b = json.loads(self.base_path.read_text())
+                self._best_dt = b.get("best_dt")
+                self._best_ep = b.get("best_ep", 0.0)
+            except (ValueError, OSError):
+                pass
+
+    def _save_baseline(self):
+        self.base_path.write_text(json.dumps({"best_dt": self._best_dt, "best_ep": self._best_ep}))
+
+    def _on_rollout_start(self):
+        self._last = None  # don't count the PPO update as a slow env step
+
+    def _on_step(self):
+        now = time.monotonic()
+        if self._last is not None:
+            self._n += 1
+            if self._n > self.WARMUP:
+                self._dts.append(now - self._last)
+        self._last = now
+        for info in self.locals.get("infos", []):
+            ep = info.get("episode")
+            if ep:
+                self._eps.append(ep["l"])
+
+        if len(self._dts) == self.WINDOW:
+            m = sum(self._dts) / self.WINDOW
+            if self._best_dt is None or m < self._best_dt:
+                self._best_dt = m
+                self._save_baseline()
+            if m > self.SLOW * self._best_dt:
+                self._trip(f"env stepping {m / self._best_dt:.1f}x slower than best "
+                           f"({m:.2f}s vs {self._best_dt:.2f}s per vec step) at {self.num_timesteps} steps")
+        if len(self._eps) == self.EP_WINDOW:
+            m = sum(self._eps) / self.EP_WINDOW
+            if m > self._best_ep:
+                self._best_ep = m
+                self._save_baseline()
+            if self._best_ep > self.EP_MIN_BEST and m < self.EP_DROP * self._best_ep:
+                self._trip(f"episode length collapsed to {m:.1f} (best {self._best_ep:.1f}) "
+                           f"at {self.num_timesteps} steps")
+        return True
+
+    def _trip(self, reason):
+        msg = f"[watchdog] stall detected: {reason}"
+        print(msg, flush=True)
+        self.flag_path.write_text(msg)
+        while True:  # wait for rl.supervise to kill this process
+            time.sleep(60)
 
 
 def make_env():
@@ -51,7 +132,12 @@ def main():
     ap.add_argument("--resume", nargs="?", const="latest", default=None,
                     help="continue from a checkpoint .zip (no value = latest for --name); "
                          "--timesteps is then the total target")
+    ap.add_argument("--watchdog-file", type=str, default=None,
+                    help="enable the stall watchdog; it writes this file when tripped (used by rl.supervise)")
     args = ap.parse_args()
+
+    # The MLP is tiny; extra torch threads only compete with the browser workers for CPU.
+    torch.set_num_threads(1)
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     TB_DIR.mkdir(parents=True, exist_ok=True)
@@ -70,14 +156,17 @@ def main():
     if remaining <= 0:
         vec_env.close()
         raise SystemExit(f"Already at {model.num_timesteps} >= target {args.timesteps}; nothing to do")
-    callback = None
+    callbacks = []
+    if args.watchdog_file:
+        callbacks.append(StallWatchdog(args.watchdog_file))
     if args.checkpoint_freq > 0:
         # save_freq counts calls per env, so divide by n_envs to get total timesteps
-        callback = CheckpointCallback(
+        callbacks.append(CheckpointCallback(
             save_freq=max(args.checkpoint_freq // args.n_envs, 1),
             save_path=str(MODELS_DIR),
             name_prefix=args.name,
-        )
+        ))
+    callback = CallbackList(callbacks) if callbacks else None
     model.learn(total_timesteps=remaining, tb_log_name=args.name, callback=callback,
                 reset_num_timesteps=args.resume is None)
     model.save(str(MODELS_DIR / args.name))
